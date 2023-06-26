@@ -1,15 +1,19 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "HomebridgeMakeToast",
   "pluginType": "platform",
   "singular": true,
   "schema": {
     "type": "object",
     "properties": {
-      "name": {
-        "title": "Name",
+      "email": {
+        "title": "Anova Email Address",
         "type": "string",
-        "required": true,
-        "default": "Example Dynamic Platform"
+        "required": true
+      },
+      "password" : {
+        "title": "Anova Password",
+        "type": "string",
+        "required": true
       }
     }
   }
