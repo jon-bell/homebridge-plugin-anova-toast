@@ -20,7 +20,7 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
   ) {
     this.log.debug('Finished initializing platform:', this.config.name);
 
-    this.anovaOvenService = new AnovaOvenService({ email: config.email, password: config.password });
+    this.anovaOvenService = new AnovaOvenService({ email: config.email, password: config.password }, log);
 
     // When this event is fired it means Homebridge has restored all cached accessories from disk.
     // Dynamic Platform plugins should only register new accessories after this event was fired,
@@ -55,14 +55,18 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
       // the cached devices we stored in the `configureAccessory` method above
       const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
       if (existingAccessory) {
+        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
         // the accessory already exists
+        // existingAccessory.displayName = oven.name;
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
         new AnovaOvenPlatformAccessory(this, existingAccessory, oven, this.config.recipes);
+        this.api.updatePlatformAccessories([existingAccessory]);
+
       } else {
         // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', oven.deviceId);
+        this.log.info(`Adding new accessory: ${oven.deviceId} ${oven.name}`);
 
-        const accessory = new this.api.platformAccessory('Countertop Oven', uuid);
+        const accessory = new this.api.platformAccessory(oven.name, uuid);
 
         // store a copy of the device object in the `accessory.context`
         // the `context` property can be used to store any data about the accessory you may need

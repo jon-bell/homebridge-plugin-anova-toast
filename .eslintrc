@@ -10,7 +10,8 @@
     "sourceType": "module"
   },
   "ignorePatterns": [
-    "dist"
+    "dist",
+    "node_modules"
   ],
   "rules": {
     "quotes": ["warn", "single"],

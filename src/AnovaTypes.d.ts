@@ -3,17 +3,31 @@ export type AnovaOvenResponse = {
 };
 export type DeviceID = string;
 
+export type OvenResponse = OvenCommandResponse | OvenStateResponse | APOWifiListResponse;
+
+export type APOWifiListResponse = {
+    command: 'EVENT_APO_WIFI_LIST';
+    payload: {
+        cookerId: DeviceID;
+        name: string;
+        pairedAt: string;
+        type: string;
+    }[];
+};
 export type OvenCommandResponse = {
-    response: 'OVEN_COMMAND_RESPONSE';
+    command: 'RESPONSE';
     requestId: string;
-    deviceId: DeviceID;
-    success: boolean;
-    data: object[];
+    payload: {
+        status: string; //current known status is only 'ok'
+    };
 };
 export type OvenStateResponse = {
-    response: 'OVEN_STATE';
-    ovenId: DeviceID;
-    data: OvenStateMessage;
+    command: 'EVENT_APO_STATE';
+    payload: {
+        cookerId: DeviceID;
+        state: OvenStateMessage;
+        type: string;
+    };
 };
 export interface OvenStateMessage {
     version: number;
@@ -142,24 +156,24 @@ export interface UserInterfaceCircuit {
     communicationFailed: boolean;
 }
 
-export type OvenCommandRequest = {
-    command: string;
-    payload: {
-        deviceId: DeviceID;
-        requestId: string;
-        command: OvenCommand;
-    };
-};
 export type OvenCommand = StartCookCommand | StopCookCommand;
-export type OvenPayload = StartCookPayload;
+
 export interface StopCookCommand {
-    id: string;
-    type: 'stopCook';
+    requestId: string;
+    command: 'CMD_APO_STOP';
+    payload: {
+        'type': 'CMD_APO_STOP';
+        'id': DeviceID;
+    };
 }
 export interface StartCookCommand {
-    id: string;
-    type: 'startCook';
-    payload: StartCookPayload;
+    requestId: string;
+    command: 'CMD_APO_START';
+    payload: {
+        payload: StartCookPayload;
+        type: 'CMD_APO_START';
+        id: DeviceID;
+    };
 }
 export interface StartCookPayload {
     cookId: string;

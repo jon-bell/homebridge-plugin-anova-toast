@@ -1,4 +1,3 @@
-import { Switch } from 'hap-nodejs/dist/lib/definitions/ServiceDefinitions';
 import { CharacteristicValue, PlatformAccessory } from 'homebridge';
 import { v4 as uuidv4 } from 'uuid';
 import { AnovaOven, Recipe } from './AnovaOvenService';
@@ -12,13 +11,18 @@ export class AnovaOvenPlatformAccessory {
     readonly oven: AnovaOven,
     readonly recipes: Recipe[],
   ) {
-    const createSwitchForRecipe = (recipe : Recipe) => {
+    const createSwitchForRecipe = (recipe: Recipe) => {
       let sw = this.accessory.getService(recipe.name);
-      if(!sw) {
-        sw = new Switch(recipe.name, recipe.name);
+      if (!sw) {
+        sw = new this.platform.api.hap.Service.Switch(recipe.name, recipe.name);
+        sw.addOptionalCharacteristic(this.platform.Characteristic.ConfiguredName);
         sw.setCharacteristic(this.platform.Characteristic.Name, recipe.name);
+        sw.setCharacteristic(this.platform.Characteristic.ConfiguredName, recipe.name);
         this.accessory.addService(sw);
       }
+
+      sw.displayName = recipe.name;
+      this.platform.log.debug('Creating switch for recipe', recipe.name);
 
       let pendingState = this.oven.isCooking(recipe.stages);
       const STATE_UPDATE_TIMEOUT_MS = 3000;
@@ -38,11 +42,9 @@ export class AnovaOvenPlatformAccessory {
         })
         .onGet(() => {
           const curState = this.oven.isCooking(recipe.stages);
-          if(pendingState !== curState && Date.now() < pendingStateExpiration){
-            this.platform.log.debug(`Get ${recipe.name} defers to pending state`);
+          if (pendingState !== curState && Date.now() < pendingStateExpiration) {
             return pendingState;
           }
-          this.platform.log.debug(`Get ${recipe.name} uses curState`);
           return curState;
         });
       return sw;
@@ -55,7 +57,8 @@ export class AnovaOvenPlatformAccessory {
       .setCharacteristic(this.platform.Characteristic.FirmwareRevision,
         `FW: ${oven.state.systemInfo.firmwareVersion}, HW: ${oven.state.systemInfo.hardwareVersion}`);
 
-    const POWER_ON_DEFAULT_STAGES : StagesEntity[] = [
+
+    const POWER_ON_DEFAULT_STAGES: StagesEntity[] = [
       {
         'title': 'Pre-heat',
         'id': uuidv4(),
@@ -122,7 +125,7 @@ export class AnovaOvenPlatformAccessory {
       },
     ];
 
-    const powerOnButton = createSwitchForRecipe({name: 'Power On', stages: POWER_ON_DEFAULT_STAGES});
+    const powerOnButton = createSwitchForRecipe({ name: 'Power On', stages: POWER_ON_DEFAULT_STAGES });
     powerOnButton.setPrimaryService(true);
     recipes.forEach(createSwitchForRecipe);
   }
