@@ -55,13 +55,10 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
       // the cached devices we stored in the `configureAccessory` method above
       const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
       if (existingAccessory) {
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
         // the accessory already exists
-        // existingAccessory.displayName = oven.name;
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
         new AnovaOvenPlatformAccessory(this, existingAccessory, oven, this.config.recipes);
-        this.api.updatePlatformAccessories([existingAccessory]);
-
+        oven.name = `${oven.name}`;
       } else {
         // the accessory does not yet exist, so we need to create it
         this.log.info(`Adding new accessory: ${oven.deviceId} ${oven.name}`);

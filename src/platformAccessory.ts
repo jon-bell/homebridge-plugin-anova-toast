@@ -5,6 +5,7 @@ import { StagesEntity } from './AnovaTypes';
 import { AnovaOvenHomebridgePlatform } from './platform';
 
 export class AnovaOvenPlatformAccessory {
+
   constructor(
     readonly platform: AnovaOvenHomebridgePlatform,
     readonly accessory: PlatformAccessory,
@@ -127,6 +128,28 @@ export class AnovaOvenPlatformAccessory {
 
     const powerOnButton = createSwitchForRecipe({ name: 'Power On', stages: POWER_ON_DEFAULT_STAGES });
     powerOnButton.setPrimaryService(true);
+
+    oven.on('ovenState', (update) => {
+      const prevCook = this.oven.curStateMessage?.cook;
+      if (update.cook && !prevCook) {
+        powerOnButton.updateCharacteristic(this.platform.Characteristic.On, true);
+      } else if (!update.cook && prevCook) {
+        powerOnButton.updateCharacteristic(this.platform.Characteristic.On, false);
+      }
+    });
+
+    oven.on('setName', (name) => {
+      const accessoryInformation = this.accessory.getService(this.platform.Service.AccessoryInformation);
+      if (accessoryInformation) {
+        this.platform.log.debug('Setting name to', name);
+        this.accessory.displayName = name;
+        //TODO - this doesn't seem to work
+        accessoryInformation.setCharacteristic(this.platform.Characteristic.Name, name);
+        accessoryInformation.setCharacteristic(this.platform.Characteristic.ConfiguredName, name);
+      }
+      this.platform.api.updatePlatformAccessories([this.accessory]);
+    });
+
     recipes.forEach(createSwitchForRecipe);
   }
 }

@@ -4,7 +4,7 @@ import TypedEventEmitter from 'typed-emitter';
 import { v4 as uuidv4 } from 'uuid';
 import WebSocket from 'ws';
 import {
-  AnovaOvenResponse, DeviceID, OvenCommand, OvenCommandResponse, OvenResponse, OvenStateMessage,
+  AnovaOvenEvent, DeviceID, OvenCommand, OvenCommandResponse, OvenResponse, OvenStateMessage,
   StagesEntity, StartCookPayload, SteamGenerators, TemperatureBulbSetPoint,
 } from './AnovaTypes';
 import { Logger } from 'homebridge';
@@ -21,6 +21,8 @@ const steamGeneratorsEqual = (a: SteamGenerators | undefined, b: SteamGenerators
   }
   if (a.mode === 'steam-percentage') {
     return a.steamPercentage?.setpoint === b.steamPercentage?.setpoint;
+  } else if(a.mode === 'relative-humidity'){
+    return a.relativeHumidity?.setpoint === b.relativeHumidity?.setpoint;
   } else {
     throw `Unknown steam mode ${a.mode}`;
   }
@@ -31,6 +33,8 @@ const temperatureBulbsEqual = (a: TemperatureBulbSetPoint, b: TemperatureBulbSet
   }
   if (a.mode === 'dry' && b.mode === 'dry') {
     return a.dry.setpoint.celsius === b.dry.setpoint.celsius;
+  } else if(a.mode === 'wet' && b.mode === 'wet'){
+    return a.wet.setpoint.celsius === b.wet.setpoint.celsius;
   } else {
     throw `Unknown temp bulb mode ${a.mode}`;
   }
@@ -45,7 +49,7 @@ const stagesEqual = (stage1: StagesEntity, stage2: StagesEntity) => {
     stage1.vent.open === stage2.vent.open;
 };
 
-export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<AnovaOvenResponse>) {
+export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<AnovaOvenEvent>) {
   private _id: DeviceID;
   private _name: string;
   private _curStateMessage: OvenStateMessage;
@@ -56,10 +60,23 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
     this._id = id;
     this._name = name;
     this.on('ovenState', (update) => {
+      const prevCook = this._curStateMessage.cook;
       this._curStateMessage = update;
+      if (update.cook && !prevCook) {
+        this._service.log.info(`Oven ${this._id} started cooking`);
+        this.emit('cookStart', update.cook);
+      } else if (prevCook && !update.cook) {
+        this._service.log.info(`Oven ${this._id} stopped cooking`);
+        this.emit('cookEnd');
+      }
     });
     this._curStateMessage = startingState;
     this._service = service;
+  }
+
+  public set name(name: string) {
+    this.emit('setName', name);
+    this._name = name;
   }
 
   public get name() {
@@ -125,7 +142,7 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
    * @param stages
    */
   public isCooking(stages: StagesEntity[]) {
-    const curCook = this._curStateMessage.cook;
+    const curCook = this._curStateMessage?.cook;
     if (!curCook) {
       return false;
     }
@@ -328,13 +345,19 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
   private _dispatchToOven(message: OvenResponse) {
     if (message.command === 'EVENT_APO_WIFI_LIST') {
       message.payload.forEach((oven) => {
-        this._pendingOvens.push({ cookerId: oven.cookerId, name: oven.name });
+        const existingOven = this.ovens.get(oven.cookerId);
+        if (existingOven) {
+          existingOven.name = oven.name;
+        } else {
+          this._pendingOvens.push({ cookerId: oven.cookerId, name: oven.name });
+        }
       });
     } else if (message.command === 'EVENT_APO_STATE') {
       const ovenId = message.payload.cookerId;
       this.log.info(`Oven ${ovenId} state changed`);
       let oven = this.ovens.get(ovenId);
       if (!oven) {
+        this.log.info(`Oven ${ovenId} not found, creating new`);
         const ovenName = this._pendingOvens.find((eachOven) => eachOven.cookerId === ovenId)?.name;
         oven = new AnovaOven(ovenId, ovenName || `Oven ${ovenId.substring(0, 4)}`, message.payload.state, this);
         this.ovens.set(ovenId, oven);
@@ -342,6 +365,7 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
       }
       oven.curStateMessage = message.payload.state;
     } else if (message.command === 'RESPONSE') {
+      this.log.info(`Received response to command ${message.requestId}`);
       this.emit('commandResponse', message);
     } else {
       this.log.warn(`Unknown message type received: ${(message as { command: string }).command}`);

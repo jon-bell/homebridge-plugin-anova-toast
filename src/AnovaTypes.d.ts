@@ -1,5 +1,8 @@
-export type AnovaOvenResponse = {
+export type AnovaOvenEvent = {
+    setName: (newName: string) => void;
     ovenState: (update: OvenStateMessage) => void;
+    cookStart: (cook: OvenStateMessage['cook']) => void;
+    cookEnd: () => void;
 };
 export type DeviceID = string;
 
@@ -108,7 +111,8 @@ export interface SteamGenerators {
     steamPercentage?: SetpointNumber;
 }
 export interface RelativeHumidity {
-    current: number;
+    current?: number;
+    setpoint: number;
 }
 export interface Evaporator {
     failed: boolean;

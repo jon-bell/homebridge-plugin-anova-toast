@@ -16,8 +16,12 @@ Default recipes:
 This plugin was created based on the code in [create new repository from template](https://github.com/homebridge/homebridge-plugin-template/generate)
 
 ## Release notes
+- Release 1.1.1: Pushes status updates to HomeKit API as oven status changes, fixes null dereference on wet bulb temperature status
 - Release 1.1.0: Support for Anova Oven Protocol Version 2
 - Release 1.0.0: Initial release (supports Anova Oven Protocol Version 1 only)
+
+## Local dev 
+`npm run build && npm link && DEBUG=* homebridge -D -C -U .` (uses `config.json` in cwd)
 
 ## Protocol notes
 Inspiration from [mcolyer's oven API V1 reverse engineering results](https://mcolyer.github.io/anova-oven-api/).
@@ -44,7 +48,8 @@ Android apps can specify whether or not to trust user-installed root certificate
 1. Download the most recent Anova Oven App APK (e.g. [from apkpure](https://m.apkpure.com/anova-oven/com.anovaculinary.anovaoven))
 2. Use [apktool](https://apktool.org) to unwrap the apk
 3. Edit the file `res/xml/network_security_config.xml`:
-    * Before: 
+
+Before: 
 ```
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
@@ -55,7 +60,8 @@ Android apps can specify whether or not to trust user-installed root certificate
     </domain-config>
 </network-security-config>
 ```
-    * After:
+After:
+
 ```
     <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
