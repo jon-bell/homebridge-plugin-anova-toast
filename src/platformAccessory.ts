@@ -129,13 +129,11 @@ export class AnovaOvenPlatformAccessory {
     const powerOnButton = createSwitchForRecipe({ name: 'Power On', stages: POWER_ON_DEFAULT_STAGES });
     powerOnButton.setPrimaryService(true);
 
-    oven.on('ovenState', (update) => {
-      const prevCook = this.oven.curStateMessage?.cook;
-      if (update.cook && !prevCook) {
-        powerOnButton.updateCharacteristic(this.platform.Characteristic.On, true);
-      } else if (!update.cook && prevCook) {
-        powerOnButton.updateCharacteristic(this.platform.Characteristic.On, false);
-      }
+    oven.on('cookStart', () => {
+      powerOnButton.updateCharacteristic(this.platform.Characteristic.On, true);
+    });
+    oven.on('cookEnd', () => {
+      powerOnButton.updateCharacteristic(this.platform.Characteristic.On, false);
     });
 
     oven.on('setName', (name) => {

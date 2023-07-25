@@ -117,6 +117,8 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
       type: 'CMD_APO_STOP',
       id: this._id,
     });
+    this._curStateMessage.cook = undefined;
+    this.emit('cookEnd');
   }
 
   /**
