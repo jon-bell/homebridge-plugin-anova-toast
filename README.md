@@ -16,6 +16,7 @@ Default recipes:
 This plugin was created based on the code in [create new repository from template](https://github.com/homebridge/homebridge-plugin-template/generate)
 
 ## Release notes
+- Release 1.1.4: Adds a retry/reconnect loop to the websocket connection to the Anova cloud service
 - Release 1.1.2: Improves latency of power on/off switch updating
 - Release 1.1.1: Pushes status updates to HomeKit API as oven status changes, fixes null dereference on wet bulb temperature status
 - Release 1.1.0: Support for Anova Oven Protocol Version 2

@@ -6,7 +6,15 @@ export type AnovaOvenEvent = {
 };
 export type DeviceID = string;
 
-export type OvenResponse = OvenCommandResponse | OvenStateResponse | APOWifiListResponse;
+export type OvenResponse = OvenCommandResponse | OvenStateResponse | APOWifiListResponse | APOEventUserStateResponse;
+
+export type APOEventUserStateResponse = {
+    command: 'EVENT_USER_STATE';
+    payload : {
+        isConnectedtoAlexa: boolean;
+        isConnectedtoGoogleHome: boolean;
+    };
+};
 
 export type APOWifiListResponse = {
     command: 'EVENT_APO_WIFI_LIST';

@@ -31,16 +31,22 @@ export class AnovaOvenPlatformAccessory {
       sw.getCharacteristic(this.platform.Characteristic.On)
         .onSet(async (value: CharacteristicValue) => {
           this.platform.log.debug(`Set Recipe ${recipe.name} On ->`, value);
-          if (!value) {
-            pendingState = false;
-            pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
-            await this.oven.stopCook();
-          } else {
-            pendingState = true;
-            pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
-            await this.oven.startCook(recipe.stages);
+          try {
+            if (!value) {
+              pendingState = false;
+              pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
+              await this.oven.stopCook();
+            } else {
+              pendingState = true;
+              pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
+              await this.oven.startCook(recipe.stages);
+            }
+          } catch (e) {
+            this.platform.log.error('Error setting recipe', e);
+            throw e;
           }
-        })
+        },
+        )
         .onGet(() => {
           const curState = this.oven.isCooking(recipe.stages);
           if (pendingState !== curState && Date.now() < pendingStateExpiration) {

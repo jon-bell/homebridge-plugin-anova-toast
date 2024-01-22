@@ -21,7 +21,7 @@ const steamGeneratorsEqual = (a: SteamGenerators | undefined, b: SteamGenerators
   }
   if (a.mode === 'steam-percentage') {
     return a.steamPercentage?.setpoint === b.steamPercentage?.setpoint;
-  } else if(a.mode === 'relative-humidity'){
+  } else if (a.mode === 'relative-humidity') {
     return a.relativeHumidity?.setpoint === b.relativeHumidity?.setpoint;
   } else {
     throw `Unknown steam mode ${a.mode}`;
@@ -33,7 +33,7 @@ const temperatureBulbsEqual = (a: TemperatureBulbSetPoint, b: TemperatureBulbSet
   }
   if (a.mode === 'dry' && b.mode === 'dry') {
     return a.dry.setpoint.celsius === b.dry.setpoint.celsius;
-  } else if(a.mode === 'wet' && b.mode === 'wet'){
+  } else if (a.mode === 'wet' && b.mode === 'wet') {
     return a.wet.setpoint.celsius === b.wet.setpoint.celsius;
   } else {
     throw `Unknown temp bulb mode ${a.mode}`;
@@ -105,7 +105,7 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
 
 
   private async _startCook(payload: StartCookPayload) {
-    await this._service.sendOvenCommand('CMD_APO_START', {
+    await this._service.sendOvenCommandWithRetries('CMD_APO_START', {
       payload: payload,
       type: 'CMD_APO_START',
       id: this._id,
@@ -113,7 +113,7 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
   }
 
   public async stopCook() {
-    await this._service.sendOvenCommand('CMD_APO_STOP', {
+    await this._service.sendOvenCommandWithRetries('CMD_APO_STOP', {
       type: 'CMD_APO_STOP',
       id: this._id,
     });
@@ -323,6 +323,7 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
 
 
       let authenticated = false;
+
       this._socket.on('message', (data) => {
         const message = JSON.parse(data.toString()) as OvenResponse;
         if (message.command === 'EVENT_APO_WIFI_LIST' && !authenticated) {
@@ -369,13 +370,27 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
     } else if (message.command === 'RESPONSE') {
       this.log.info(`Received response to command ${message.requestId}`);
       this.emit('commandResponse', message);
+    } else if (message.command === 'EVENT_USER_STATE') {
+      // ignore
     } else {
       this.log.warn(`Unknown message type received: ${(message as { command: string }).command}`);
       this.log.debug(JSON.stringify(message, null, 2));
     }
   }
 
-  public async sendOvenCommand<T extends OvenCommand>(command: T['command'], payload: T['payload']) {
+  public async sendOvenCommandWithRetries<T extends OvenCommand>(command: T['command'], payload: T['payload'], retries = 3) {
+    try {
+      await this._sendOvenCommand(command, payload);
+    } catch (e) {
+      if (retries > 0) {
+        await this.login();
+        return await this.sendOvenCommandWithRetries(command, payload, retries - 1);
+      }
+      throw e;
+    }
+  }
+
+  private async _sendOvenCommand<T extends OvenCommand>(command: T['command'], payload: T['payload'], timeoutMS = 5000) {
     const cmd = {
       command,
       payload,
@@ -384,10 +399,12 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
     this.log.info(`Sending command ${cmd.requestId}`);
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(`Timeout waiting for response to command ${cmd.requestId}`);
-      }, 5000);
+        this.log.error(`Timeout waiting for response to command ${cmd.requestId}`);
+        reject(new Error('Timeout waiting for response to command'));
+      }, timeoutMS);
 
       const watchdog = (response: OvenCommandResponse) => {
+        this.log.info(`Received response to cmd ${cmd.requestId}`);
         if (response.requestId === cmd.requestId) {
           this.off('commandResponse', watchdog);
           clearTimeout(timeout);
@@ -402,6 +419,7 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
         }
       };
       this.on('commandResponse', watchdog);
+      this.log.info(`Sending command ${JSON.stringify(cmd)}`);
       this._socket.send(JSON.stringify(cmd));
     });
   }
