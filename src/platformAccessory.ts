@@ -1,10 +1,86 @@
-import { CharacteristicValue, PlatformAccessory } from 'homebridge';
-import { v4 as uuidv4 } from 'uuid';
+import { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
 import { AnovaOven, Recipe } from './AnovaOvenService';
 import { StagesEntity } from './AnovaTypes';
 import { AnovaOvenHomebridgePlatform } from './platform';
 
+/** Subtype/name of the main on/off switch. Unchanged from earlier versions so existing HomeKit setups keep working. */
+const POWER_SWITCH_NAME = 'Power On';
+
+/** After a tap, report the requested state for this long while waiting for the oven to confirm it. */
+const STATE_UPDATE_TIMEOUT_MS = 5000;
+
+const POWER_ON_DEFAULT_STAGES: StagesEntity[] = [
+  {
+    'title': 'Pre-heat',
+    'type': 'preheat',
+    'userActionRequired': false,
+    'temperatureBulbs': {
+      'mode': 'dry',
+      'dry': {
+        'setpoint': {
+          'celsius': 176.67,
+          'fahrenheit': 350,
+        },
+      },
+    },
+    'heatingElements': {
+      'top': {
+        'on': false,
+      },
+      'bottom': {
+        'on': true,
+      },
+      'rear': {
+        'on': false,
+      },
+    },
+    'fan': {
+      'speed': 33,
+    },
+    'vent': {
+      'open': false,
+    },
+  },
+  {
+    'title': 'Bake',
+    'type': 'cook',
+    'userActionRequired': false,
+    'temperatureBulbs': {
+      'mode': 'dry',
+      'dry': {
+        'setpoint': {
+          'celsius': 176.67,
+          'fahrenheit': 350,
+        },
+      },
+    },
+    'heatingElements': {
+      'top': {
+        'on': false,
+      },
+      'bottom': {
+        'on': true,
+      },
+      'rear': {
+        'on': false,
+      },
+    },
+    'fan': {
+      'speed': 33,
+    },
+    'vent': {
+      'open': false,
+    },
+  },
+];
+
+type ManagedSwitch = {
+  service: Service;
+  currentValue: () => boolean;
+};
+
 export class AnovaOvenPlatformAccessory {
+  private readonly switches: ManagedSwitch[] = [];
 
   constructor(
     readonly platform: AnovaOvenHomebridgePlatform,
@@ -12,148 +88,104 @@ export class AnovaOvenPlatformAccessory {
     readonly oven: AnovaOven,
     readonly recipes: Recipe[],
   ) {
-    const createSwitchForRecipe = (recipe: Recipe) => {
-      let sw = this.accessory.getService(recipe.name);
-      if (!sw) {
-        sw = new this.platform.api.hap.Service.Switch(recipe.name, recipe.name);
-        sw.addOptionalCharacteristic(this.platform.Characteristic.ConfiguredName);
-        sw.setCharacteristic(this.platform.Characteristic.Name, recipe.name);
-        sw.setCharacteristic(this.platform.Characteristic.ConfiguredName, recipe.name);
-        this.accessory.addService(sw);
-      }
+    const { Characteristic } = this.platform;
 
-      sw.displayName = recipe.name;
-      this.platform.log.debug('Creating switch for recipe', recipe.name);
-
-      let pendingState = this.oven.isCooking(recipe.stages);
-      const STATE_UPDATE_TIMEOUT_MS = 3000;
-      let pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
-      sw.getCharacteristic(this.platform.Characteristic.On)
-        .onSet(async (value: CharacteristicValue) => {
-          this.platform.log.debug(`Set Recipe ${recipe.name} On ->`, value);
-          try {
-            if (!value) {
-              pendingState = false;
-              pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
-              await this.oven.stopCook();
-            } else {
-              pendingState = true;
-              pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
-              await this.oven.startCook(recipe.stages);
-            }
-          } catch (e) {
-            this.platform.log.error('Error setting recipe', e);
-            throw e;
-          }
-        },
-        )
-        .onGet(() => {
-          const curState = this.oven.isCooking(recipe.stages);
-          if (pendingState !== curState && Date.now() < pendingStateExpiration) {
-            return pendingState;
-          }
-          return curState;
-        });
-      return sw;
-    };
-    // set accessory information
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Anova Culinary')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Precision Oven')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, oven.deviceId)
-      .setCharacteristic(this.platform.Characteristic.FirmwareRevision,
-        `FW: ${oven.state.systemInfo.firmwareVersion}, HW: ${oven.state.systemInfo.hardwareVersion}`);
+      .setCharacteristic(Characteristic.Manufacturer, 'Anova Culinary')
+      .setCharacteristic(Characteristic.Model, 'Precision Oven')
+      .setCharacteristic(Characteristic.SerialNumber, oven.deviceId)
+      .setCharacteristic(Characteristic.FirmwareRevision,
+        `FW: ${oven.state.systemInfo?.firmwareVersion}, HW: ${oven.state.systemInfo?.hardwareVersion}`);
 
+    // The power switch is on whenever the oven is cooking anything, however it was started.
+    const powerSwitch = this.createSwitch(
+      POWER_SWITCH_NAME,
+      () => this.oven.isOn,
+      () => this.oven.startCook(POWER_ON_DEFAULT_STAGES),
+    );
+    powerSwitch.setPrimaryService(true);
 
-    const POWER_ON_DEFAULT_STAGES: StagesEntity[] = [
-      {
-        'title': 'Pre-heat',
-        'id': uuidv4(),
-        'type': 'preheat',
-        'userActionRequired': false,
-        'temperatureBulbs': {
-          'mode': 'dry',
-          'dry': {
-            'setpoint': {
-              'celsius': 176.67,
-              'fahrenheit': 350,
-            },
-          },
-        },
-        'heatingElements': {
-          'top': {
-            'on': false,
-          },
-          'bottom': {
-            'on': true,
-          },
-          'rear': {
-            'on': false,
-          },
-        },
-        'fan': {
-          'speed': 33,
-        },
-        'vent': {
-          'open': false,
-        },
-      },
-      {
-        'title': 'Bake',
-        'id': uuidv4(),
-        'type': 'cook',
-        'userActionRequired': false,
-        'temperatureBulbs': {
-          'mode': 'dry',
-          'dry': {
-            'setpoint': {
-              'celsius': 176.67,
-              'fahrenheit': 350,
-            },
-          },
-        },
-        'heatingElements': {
-          'top': {
-            'on': false,
-          },
-          'bottom': {
-            'on': true,
-          },
-          'rear': {
-            'on': false,
-          },
-        },
-        'fan': {
-          'speed': 33,
-        },
-        'vent': {
-          'open': false,
-        },
-      },
-    ];
+    // Recipe switches are on only while that recipe's stages are the active cook.
+    recipes.forEach((recipe) => this.createSwitch(
+      recipe.name,
+      () => this.oven.isCooking(recipe.stages),
+      () => this.oven.startCook(recipe.stages),
+    ));
 
-    const powerOnButton = createSwitchForRecipe({ name: 'Power On', stages: POWER_ON_DEFAULT_STAGES });
-    powerOnButton.setPrimaryService(true);
+    this.removeStaleSwitches([POWER_SWITCH_NAME, ...recipes.map((r) => r.name)]);
 
-    oven.on('cookStart', () => {
-      powerOnButton.updateCharacteristic(this.platform.Characteristic.On, true);
-    });
-    oven.on('cookEnd', () => {
-      powerOnButton.updateCharacteristic(this.platform.Characteristic.On, false);
-    });
+    // Push every switch's state to HomeKit whenever the oven reports a change.
+    oven.on('ovenState', () => this.refresh());
+    oven.on('cookStart', () => this.refresh());
+    oven.on('cookEnd', () => this.refresh());
 
     oven.on('setName', (name) => {
-      const accessoryInformation = this.accessory.getService(this.platform.Service.AccessoryInformation);
-      if (accessoryInformation) {
-        this.platform.log.debug('Setting name to', name);
-        this.accessory.displayName = name;
-        //TODO - this doesn't seem to work
-        accessoryInformation.setCharacteristic(this.platform.Characteristic.Name, name);
-        accessoryInformation.setCharacteristic(this.platform.Characteristic.ConfiguredName, name);
-      }
+      this.platform.log.debug('Setting name to', name);
+      this.accessory.displayName = name;
       this.platform.api.updatePlatformAccessories([this.accessory]);
     });
+  }
 
-    recipes.forEach(createSwitchForRecipe);
+  private refresh() {
+    for (const sw of this.switches) {
+      sw.service.updateCharacteristic(this.platform.Characteristic.On, sw.currentValue());
+    }
+  }
+
+  private createSwitch(name: string, isActive: () => boolean, start: () => Promise<unknown>) {
+    const { Characteristic, api } = this.platform;
+    let sw = this.accessory.getServiceById(this.platform.Service.Switch, name);
+    if (!sw) {
+      sw = new this.platform.Service.Switch(name, name);
+      sw.addOptionalCharacteristic(Characteristic.ConfiguredName);
+      sw.setCharacteristic(Characteristic.Name, name);
+      sw.setCharacteristic(Characteristic.ConfiguredName, name);
+      this.accessory.addService(sw);
+    }
+    sw.displayName = name;
+    this.platform.log.debug('Creating switch', name);
+
+    let pendingState: boolean | undefined;
+    let pendingStateExpiration = 0;
+    const currentValue = () => {
+      const actual = isActive();
+      if (pendingState !== undefined && pendingState !== actual && Date.now() < pendingStateExpiration) {
+        return pendingState;
+      }
+      pendingState = undefined;
+      return actual;
+    };
+
+    sw.getCharacteristic(Characteristic.On)
+      .onSet(async (value: CharacteristicValue) => {
+        this.platform.log.debug(`Set ${name} ->`, value);
+        pendingState = Boolean(value);
+        pendingStateExpiration = Date.now() + STATE_UPDATE_TIMEOUT_MS;
+        try {
+          if (value) {
+            await start();
+          } else {
+            await this.oven.stopCook();
+          }
+        } catch (e) {
+          pendingState = undefined;
+          this.platform.log.error(`Could not turn ${name} ${value ? 'on' : 'off'}: ${e instanceof Error ? e.message : e}`);
+          throw new api.hap.HapStatusError(api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+        }
+      })
+      .onGet(() => currentValue());
+
+    this.switches.push({ service: sw, currentValue });
+    return sw;
+  }
+
+  /** Remove switches for recipes that are no longer in the config. */
+  private removeStaleSwitches(keep: string[]) {
+    this.accessory.services
+      .filter((service) => service.UUID === this.platform.Service.Switch.UUID && !keep.includes(service.subtype ?? ''))
+      .forEach((service) => {
+        this.platform.log.info(`Removing switch "${service.displayName}" (no longer in the recipe list)`);
+        this.accessory.removeService(service);
+      });
   }
 }

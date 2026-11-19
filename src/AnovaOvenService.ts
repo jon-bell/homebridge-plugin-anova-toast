@@ -5,422 +5,571 @@ import { v4 as uuidv4 } from 'uuid';
 import WebSocket from 'ws';
 import {
   AnovaOvenEvent, DeviceID, OvenCommand, OvenCommandResponse, OvenResponse, OvenStateMessage,
-  StagesEntity, StartCookPayload, SteamGenerators, TemperatureBulbSetPoint,
+  StagesEntity, SteamGenerators, TemperatureBulbSetPoint,
 } from './AnovaTypes';
 import { Logger } from 'homebridge';
+
+const DEFAULT_WEBSOCKET_URL = 'wss://devices.anovaculinary.io/';
+const DEFAULT_AUTH_URL =
+  'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyCGJwHXUhkNBdPkH3OAkjc9-3xMMjvanfU';
+
+/** How long to wait after opening the socket for Anova to send the oven list. */
+const CONNECT_TIMEOUT_MS = 15_000;
+/** How long to wait for Anova to acknowledge a command. */
+const COMMAND_TIMEOUT_MS = 10_000;
+const COMMAND_ATTEMPTS = 3;
+/** Keep-alive ping interval. */
+const PING_INTERVAL_MS = 30_000;
+/** If nothing at all arrives for this long, assume the socket is dead and reconnect. */
+const STALE_CONNECTION_MS = 10 * 60_000;
+const MIN_RECONNECT_DELAY_MS = 1_000;
+const MAX_RECONNECT_DELAY_MS = 5 * 60_000;
+/**
+ * Only reset the backoff once a connection has stayed up this long, so that a server that accepts and then
+ * immediately drops us (e.g. Anova's rate limiting) doesn't cause a tight reconnect loop.
+ */
+const STABLE_CONNECTION_MS = 60_000;
+
+/** Firebase error codes that mean the configured credentials are wrong (retrying won't help). */
+const BAD_CREDENTIAL_CODES = [
+  'EMAIL_NOT_FOUND', 'INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS', 'INVALID_EMAIL',
+  'MISSING_PASSWORD', 'MISSING_EMAIL', 'USER_DISABLED',
+];
+
+/** Temperatures reported back by the oven may be rounded differently from the configured recipe. */
+const TEMPERATURE_TOLERANCE_C = 0.1;
+
+export class AuthenticationError extends Error { }
+export class CommandRejectedError extends Error { }
+export class CommandTimeoutError extends Error { }
+export class NotConnectedError extends Error { }
+
+const describeError = (e: unknown): string => {
+  if (axios.isAxiosError(e)) {
+    const code = (e.response?.data as { error?: { message?: string } } | undefined)?.error?.message;
+    return code ? `${e.message} (${code})` : e.message;
+  }
+  return e instanceof Error ? e.message : String(e);
+};
 
 const steamGeneratorsEqual = (a: SteamGenerators | undefined, b: SteamGenerators | undefined) => {
   if (!a && !b) {
     return true;
   }
-  if (!a || !b) {
-    return false;
-  }
-  if (a.mode !== b.mode) {
+  if (!a || !b || a.mode !== b.mode) {
     return false;
   }
   if (a.mode === 'steam-percentage') {
     return a.steamPercentage?.setpoint === b.steamPercentage?.setpoint;
-  } else if (a.mode === 'relative-humidity') {
-    return a.relativeHumidity?.setpoint === b.relativeHumidity?.setpoint;
-  } else {
-    throw `Unknown steam mode ${a.mode}`;
   }
+  if (a.mode === 'relative-humidity') {
+    return a.relativeHumidity?.setpoint === b.relativeHumidity?.setpoint;
+  }
+  // Unknown steam mode: treat matching modes as equal rather than throwing inside a HomeKit read.
+  return true;
 };
-const temperatureBulbsEqual = (a: TemperatureBulbSetPoint, b: TemperatureBulbSetPoint) => {
-  if (a.mode !== b.mode) {
+
+const temperaturesEqual = (a: number | undefined, b: number | undefined) =>
+  typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) <= TEMPERATURE_TOLERANCE_C;
+
+const temperatureBulbsEqual = (a: TemperatureBulbSetPoint | undefined, b: TemperatureBulbSetPoint | undefined) => {
+  if (!a || !b || a.mode !== b.mode) {
     return false;
   }
   if (a.mode === 'dry' && b.mode === 'dry') {
-    return a.dry.setpoint.celsius === b.dry.setpoint.celsius;
-  } else if (a.mode === 'wet' && b.mode === 'wet') {
-    return a.wet.setpoint.celsius === b.wet.setpoint.celsius;
-  } else {
-    throw `Unknown temp bulb mode ${a.mode}`;
+    return temperaturesEqual(a.dry?.setpoint?.celsius, b.dry?.setpoint?.celsius);
   }
+  if (a.mode === 'wet' && b.mode === 'wet') {
+    return temperaturesEqual(a.wet?.setpoint?.celsius, b.wet?.setpoint?.celsius);
+  }
+  return false;
 };
+
 const stagesEqual = (stage1: StagesEntity, stage2: StagesEntity) => {
-  return stage1.fan.speed === stage2.fan.speed &&
-    stage1.heatingElements.bottom.on === stage2.heatingElements.bottom.on &&
-    stage1.heatingElements.rear.on === stage2.heatingElements.rear.on &&
-    stage1.heatingElements.top.on === stage2.heatingElements.top.on &&
+  return stage1.fan?.speed === stage2.fan?.speed &&
+    stage1.heatingElements?.bottom?.on === stage2.heatingElements?.bottom?.on &&
+    stage1.heatingElements?.rear?.on === stage2.heatingElements?.rear?.on &&
+    stage1.heatingElements?.top?.on === stage2.heatingElements?.top?.on &&
     steamGeneratorsEqual(stage1.steamGenerators, stage2.steamGenerators) &&
     temperatureBulbsEqual(stage1.temperatureBulbs, stage2.temperatureBulbs) &&
-    stage1.vent.open === stage2.vent.open;
+    stage1.vent?.open === stage2.vent?.open;
 };
 
 export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<AnovaOvenEvent>) {
-  private _id: DeviceID;
   private _name: string;
-  private _curStateMessage: OvenStateMessage;
-  private _service: AnovaOvenService;
+  private _state: OvenStateMessage;
 
-  public constructor(id: DeviceID, name: string, startingState: OvenStateMessage, service: AnovaOvenService) {
+  public constructor(
+    public readonly deviceId: DeviceID,
+    name: string,
+    startingState: OvenStateMessage,
+    private readonly service: AnovaOvenService,
+  ) {
     super();
-    this._id = id;
     this._name = name;
-    this.on('ovenState', (update) => {
-      const prevCook = this._curStateMessage.cook;
-      this._curStateMessage = update;
-      if (update.cook && !prevCook) {
-        this._service.log.info(`Oven ${this._id} started cooking`);
-        this.emit('cookStart', update.cook);
-      } else if (prevCook && !update.cook) {
-        this._service.log.info(`Oven ${this._id} stopped cooking`);
-        this.emit('cookEnd');
-      }
-    });
-    this._curStateMessage = startingState;
-    this._service = service;
+    this._state = startingState;
   }
 
   public set name(name: string) {
-    this.emit('setName', name);
+    if (name === this._name) {
+      return;
+    }
     this._name = name;
+    this.emit('setName', name);
   }
 
   public get name() {
     return this._name;
   }
 
-  public set curStateMessage(update: OvenStateMessage) {
-    this.emit('ovenState', update);
-    if (update.state.mode !== this._curStateMessage.state.mode) {
-      this._service.log.info(`Oven ${this._id} is in state ${update.state.mode}`);
+  /** Apply a state update received from the Anova cloud. */
+  public updateState(update: OvenStateMessage) {
+    const prev = this._state;
+    this._state = update;
+    if (update.state?.mode !== prev.state?.mode) {
+      this.service.log.info(`Oven ${this.deviceId} is in state ${update.state?.mode}`);
     }
-    this._curStateMessage = update;
+    this.emit('ovenState', update);
+    if (update.cook && !prev.cook) {
+      this.service.log.info(`Oven ${this.deviceId} started cooking`);
+      this.emit('cookStart', update.cook);
+    } else if (prev.cook && !update.cook) {
+      this.service.log.info(`Oven ${this.deviceId} stopped cooking`);
+      this.emit('cookEnd');
+    }
   }
 
+  /** True while the oven is running any cook (from HomeKit, the app, or the oven's own controls). */
   public get isOn(): boolean {
-    return this._curStateMessage.state.mode === 'cook';
-  }
-
-  public get deviceId(): DeviceID {
-    return this._id;
+    return Boolean(this._state.cook);
   }
 
   public get state(): OvenStateMessage {
-    return this._curStateMessage;
-  }
-
-
-  private async _startCook(payload: StartCookPayload) {
-    await this._service.sendOvenCommandWithRetries('CMD_APO_START', {
-      payload: payload,
-      type: 'CMD_APO_START',
-      id: this._id,
-    });
+    return this._state;
   }
 
   public async stopCook() {
-    await this._service.sendOvenCommandWithRetries('CMD_APO_STOP', {
+    await this.service.sendOvenCommand('CMD_APO_STOP', {
       type: 'CMD_APO_STOP',
-      id: this._id,
+      id: this.deviceId,
     });
-    this._curStateMessage.cook = undefined;
-    this.emit('cookEnd');
+    if (this._state.cook) {
+      this._state = { ...this._state, cook: undefined };
+      this.emit('cookEnd');
+    }
   }
 
   /**
-   * Convenience method for starting a cook givnen a set of stages.
-   * Ensures that a UUID is set on each stage
-   * Returns the cook ID
-   *
-   * @param stages
+   * Start a cook with the given stages. Stages without an ID get a fresh UUID; the caller's
+   * objects are not modified. Returns the cook ID.
    */
   public async startCook(stages: StagesEntity[]) {
-    stages.forEach(eachStage => {
-      if (!eachStage.id) {
-        eachStage.id = uuidv4();
-      }
-    });
+    const cookStages = stages.map((stage) => ({ ...stage, id: stage.id || uuidv4() }));
     const cookId = uuidv4();
-    await this._startCook({ cookId, stages });
+    await this.service.sendOvenCommand('CMD_APO_START', {
+      payload: { cookId, stages: cookStages },
+      type: 'CMD_APO_START',
+      id: this.deviceId,
+    });
     return cookId;
   }
 
   /**
-   * Returns true if the currently active cook has the same stages (by object equality, does not rely on stage ID or cook ID)
-   * @param stages
+   * Returns true if the currently active cook has the same stages (compares settings, not stage or cook IDs)
    */
   public isCooking(stages: StagesEntity[]) {
-    const curCook = this._curStateMessage?.cook;
-    if (!curCook) {
-      return false;
-    }
-    if (curCook.stages.length !== stages.length) {
+    const curCook = this._state?.cook;
+    if (!curCook?.stages || curCook.stages.length !== stages.length) {
       return false;
     }
     return stages.every((v, idx) => stagesEqual(v, curCook.stages[idx]));
   }
-
-  public async makeToast() {
-    const toastStepIDs = [uuidv4(), uuidv4(), uuidv4()];
-    const newToast: StartCookPayload = {
-      cookId: uuidv4(),
-      stages: [
-        {
-          'title': 'Start Cook',
-          'id': toastStepIDs[0],
-          'type': 'cook',
-          'userActionRequired': true,
-          'temperatureBulbs': {
-            'mode': 'dry',
-            'dry': {
-              'setpoint': {
-                'celsius': 250,
-                'fahrenheit': 482,
-              },
-            },
-          },
-          'timer': {
-            'initial': 180,
-          },
-          'heatingElements': {
-            'top': {
-              'on': true,
-            },
-            'bottom': {
-              'on': false,
-            },
-            'rear': {
-              'on': false,
-            },
-          },
-          'fan': {
-            'speed': 0,
-          },
-          'vent': {
-            'open': false,
-          },
-        },
-        {
-          'title': 'Add Steam',
-          'id': toastStepIDs[1],
-          'type': 'cook',
-          'userActionRequired': false,
-          'temperatureBulbs': {
-            'mode': 'dry',
-            'dry': {
-              'setpoint': {
-                'celsius': 250,
-                'fahrenheit': 482,
-              },
-            },
-          },
-          'steamGenerators': {
-            'mode': 'steam-percentage',
-            'steamPercentage': {
-              'setpoint': 100,
-            },
-          },
-          'timer': {
-            'initial': 240,
-          },
-          'heatingElements': {
-            'top': {
-              'on': false,
-            },
-            'bottom': {
-              'on': false,
-            },
-            'rear': {
-              'on': true,
-            },
-          },
-          'fan': {
-            'speed': 100,
-          },
-          'vent': {
-            'open': false,
-          },
-        },
-        {
-          'title': 'Cool Down',
-          'id': toastStepIDs[2],
-          'type': 'cook',
-          'userActionRequired': false,
-          'temperatureBulbs': {
-            'mode': 'dry',
-            'dry': {
-              'setpoint': {
-                'celsius': 25,
-                'fahrenheit': 77,
-              },
-            },
-          },
-          'timer': {
-            'initial': 60,
-          },
-          'heatingElements': {
-            'top': {
-              'on': false,
-            },
-            'bottom': {
-              'on': true,
-            },
-            'rear': {
-              'on': false,
-            },
-          },
-          'fan': {
-            'speed': 0,
-          },
-          'vent': {
-            'open': false,
-          },
-        },
-      ],
-    };
-    await this._startCook(newToast);
-    return newToast.cookId;
-  }
-
 }
-export type AnovaOvenServiceResponse = {
-  authenticated: () => void;
+
+export type AnovaOvenServiceEvents = {
+  connected: () => void;
+  disconnected: () => void;
   ovenFound: (oven: AnovaOven) => void;
   commandResponse: (response: OvenCommandResponse) => void;
 };
+
 export type Recipe = {
   name: string;
   stages: StagesEntity[];
 };
 
-export default class AnovaOvenService extends (EventEmitter as new () => TypedEventEmitter<AnovaOvenServiceResponse>) {
+export type AnovaOvenServiceOptions = {
+  email: string;
+  password: string;
+  /** Overrides for local development/testing against a mock server. */
+  websocketUrl?: string;
+  authUrl?: string;
+};
 
-  private _email: string;
-  private _password: string;
-  private _socket: WebSocket;
-  public log: Logger;
+/**
+ * Maintains a single WebSocket connection to the Anova cloud, reconnecting with backoff when it drops.
+ */
+export default class AnovaOvenService extends (EventEmitter as new () => TypedEventEmitter<AnovaOvenServiceEvents>) {
   public readonly ovens: Map<DeviceID, AnovaOven> = new Map();
 
-  public constructor(args: { email: string; password: string }, logger: Logger) {
+  private socket?: WebSocket;
+  private connected = false;
+  private running = false;
+  private connecting = false;
+  private credentialsRejected = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer?: NodeJS.Timeout;
+  private pingTimer?: NodeJS.Timeout;
+  private staleTimer?: NodeJS.Timeout;
+  private stableTimer?: NodeJS.Timeout;
+  private readonly ovenNames = new Map<DeviceID, string>();
+
+  public constructor(private readonly options: AnovaOvenServiceOptions, public readonly log: Logger) {
     super();
-    this._email = args.email;
-    this.log = logger;
-    this._password = args.password;
+    // One listener per in-flight command or waiter; avoid spurious leak warnings.
+    this.setMaxListeners(50);
   }
 
-  public async login(): Promise<void> {
-    // login to google firebase
-    // get token
-    const { data } = await axios({
-      method: 'post',
-      url: 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyCGJwHXUhkNBdPkH3OAkjc9-3xMMjvanfU',
-      headers: { 'content-type': 'application/json' },
-      data: {
-        email: this._email,
-        password: this._password,
-        returnSecureToken: true,
-      },
-    });
-
-    return new Promise((resolve, reject) => {
-      //open socket to API
-      this._socket = new WebSocket(`wss://devices.anovaculinary.io/?token=${data.idToken}&supportedAccessories=APO&platform=android`,
-        'ANOVA_V2');
-
-
-      let authenticated = false;
-
-      this._socket.on('message', (data) => {
-        const message = JSON.parse(data.toString()) as OvenResponse;
-        if (message.command === 'EVENT_APO_WIFI_LIST' && !authenticated) {
-          authenticated = true;
-          this.emit('authenticated');
-        }
-        this._dispatchToOven(message);
-      });
-
-      const timeout = setTimeout(() => {
-        reject('Timeout connecting to API or authentication failed');
-      }, 15000);
-      this.once('authenticated', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    },
-    );
+  public get isConnected() {
+    return this.connected && this.socket?.readyState === WebSocket.OPEN;
   }
 
-  private _pendingOvens: { cookerId: DeviceID; name: string }[] = [];
-  private _dispatchToOven(message: OvenResponse) {
-    if (message.command === 'EVENT_APO_WIFI_LIST') {
-      message.payload.forEach((oven) => {
-        const existingOven = this.ovens.get(oven.cookerId);
-        if (existingOven) {
-          existingOven.name = oven.name;
-        } else {
-          this._pendingOvens.push({ cookerId: oven.cookerId, name: oven.name });
-        }
-      });
-    } else if (message.command === 'EVENT_APO_STATE') {
-      const ovenId = message.payload.cookerId;
-      this.log.info(`Oven ${ovenId} state changed`);
-      let oven = this.ovens.get(ovenId);
-      if (!oven) {
-        this.log.info(`Oven ${ovenId} not found, creating new`);
-        const ovenName = this._pendingOvens.find((eachOven) => eachOven.cookerId === ovenId)?.name;
-        oven = new AnovaOven(ovenId, ovenName || `Oven ${ovenId.substring(0, 4)}`, message.payload.state, this);
-        this.ovens.set(ovenId, oven);
-        this.emit('ovenFound', oven);
-      }
-      oven.curStateMessage = message.payload.state;
-    } else if (message.command === 'RESPONSE') {
-      this.log.info(`Received response to command ${message.requestId}`);
-      this.emit('commandResponse', message);
-    } else if (message.command === 'EVENT_USER_STATE') {
-      // ignore
-    } else {
-      this.log.warn(`Unknown message type received: ${(message as { command: string }).command}`);
-      this.log.debug(JSON.stringify(message, null, 2));
+  /** Connect and stay connected until stop() is called. */
+  public start() {
+    if (this.running) {
+      return;
+    }
+    this.running = true;
+    void this.connect();
+  }
+
+  public stop() {
+    this.running = false;
+    this.clearReconnectTimer();
+    this.clearConnectionTimers();
+    const socket = this.socket;
+    this.socket = undefined;
+    this.connected = false;
+    if (socket) {
+      socket.removeAllListeners('message');
+      socket.on('error', () => undefined);
+      socket.terminate();
     }
   }
 
-  public async sendOvenCommandWithRetries<T extends OvenCommand>(command: T['command'], payload: T['payload'], retries = 3) {
+  /** Builds the URL (including credentials) and subprotocols used to open the socket. */
+  protected async getConnectionParameters(): Promise<{ url: string; protocols?: string[] }> {
+    const token = await this.getFirebaseToken();
+    const base = this.options.websocketUrl ?? DEFAULT_WEBSOCKET_URL;
+    return {
+      url: `${base}?token=${encodeURIComponent(token)}&supportedAccessories=APO&platform=android`,
+      protocols: ['ANOVA_V2'],
+    };
+  }
+
+  private async getFirebaseToken(): Promise<string> {
     try {
-      await this._sendOvenCommand(command, payload);
+      const { data } = await axios({
+        method: 'post',
+        url: this.options.authUrl ?? DEFAULT_AUTH_URL,
+        headers: { 'content-type': 'application/json' },
+        timeout: 15_000,
+        data: {
+          email: this.options.email,
+          password: this.options.password,
+          returnSecureToken: true,
+        },
+      });
+      return data.idToken;
     } catch (e) {
-      if (retries > 0) {
-        await this.login();
-        return await this.sendOvenCommandWithRetries(command, payload, retries - 1);
+      const code = axios.isAxiosError(e)
+        ? (e.response?.data as { error?: { message?: string } } | undefined)?.error?.message
+        : undefined;
+      if (code && BAD_CREDENTIAL_CODES.some((bad) => code.startsWith(bad))) {
+        throw new AuthenticationError(`Anova rejected the email/password (${code}).`);
       }
       throw e;
     }
   }
 
-  private async _sendOvenCommand<T extends OvenCommand>(command: T['command'], payload: T['payload'], timeoutMS = 5000) {
+  private async connect(): Promise<void> {
+    if (!this.running || this.connecting || this.socket) {
+      return;
+    }
+    this.connecting = true;
+    this.clearReconnectTimer();
+
+    let params: { url: string; protocols?: string[] };
+    try {
+      params = await this.getConnectionParameters();
+    } catch (e) {
+      this.connecting = false;
+      if (e instanceof AuthenticationError) {
+        this.credentialsRejected = true;
+        this.log.error(`${e.message} Fix the credentials in the plugin settings and restart Homebridge.`);
+        return;
+      }
+      this.log.warn(`Could not sign in to Anova: ${describeError(e)}`);
+      this.scheduleReconnect();
+      return;
+    }
+    this.connecting = false;
+    if (!this.running) {
+      return;
+    }
+
+    const socket = new WebSocket(params.url, params.protocols);
+    this.socket = socket;
+    let lastError: Error | undefined;
+
+    const connectTimeout = setTimeout(() => {
+      this.log.warn('Timed out waiting for the Anova cloud to respond; reconnecting');
+      socket.terminate();
+    }, CONNECT_TIMEOUT_MS);
+
+    socket.on('open', () => {
+      this.log.debug('WebSocket open, waiting for oven list');
+      this.pingTimer = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.ping();
+        }
+      }, PING_INTERVAL_MS);
+      this.resetStaleTimer(socket);
+    });
+
+    socket.on('message', (raw) => {
+      if (socket !== this.socket) {
+        return;
+      }
+      this.resetStaleTimer(socket);
+      let message: OvenResponse;
+      try {
+        message = JSON.parse(raw.toString()) as OvenResponse;
+      } catch {
+        this.log.warn('Ignoring a message from Anova that was not valid JSON');
+        return;
+      }
+      if (message.command === 'EVENT_APO_WIFI_LIST' && !this.connected) {
+        clearTimeout(connectTimeout);
+        this.connected = true;
+        this.stableTimer = setTimeout(() => {
+          this.reconnectAttempts = 0;
+        }, STABLE_CONNECTION_MS);
+        this.log.info('Connected to the Anova cloud');
+        this.emit('connected');
+      }
+      this.dispatch(message);
+    });
+
+    // Without an 'error' listener, ws re-throws and takes down the whole Homebridge process.
+    socket.on('error', (err) => {
+      lastError = err;
+      this.log.warn(`Anova connection error: ${err.message}`);
+    });
+
+    socket.on('close', (code, reason) => {
+      clearTimeout(connectTimeout);
+      if (socket !== this.socket) {
+        return;
+      }
+      this.socket = undefined;
+      this.clearConnectionTimers();
+      const wasConnected = this.connected;
+      this.connected = false;
+      if (wasConnected) {
+        const why = reason?.length ? `: ${reason.toString()}` : '';
+        this.log.warn(`Disconnected from the Anova cloud (code ${code}${why})`);
+        this.emit('disconnected');
+      }
+      if (lastError && /Unexpected server response: 40[13]/.test(lastError.message)) {
+        this.credentialsRejected = true;
+        this.log.error('Anova refused the connection (not authorized). Check the credentials in the plugin settings '
+          + 'and restart Homebridge.');
+        return;
+      }
+      this.scheduleReconnect();
+    });
+  }
+
+  private scheduleReconnect() {
+    if (!this.running || this.reconnectTimer || this.credentialsRejected) {
+      return;
+    }
+    const backoff = Math.min(MAX_RECONNECT_DELAY_MS, MIN_RECONNECT_DELAY_MS * 2 ** this.reconnectAttempts);
+    const delay = Math.round(backoff * (0.8 + Math.random() * 0.4));
+    this.reconnectAttempts++;
+    this.log.info(`Reconnecting to the Anova cloud in ${Math.round(delay / 1000)}s`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.connect();
+    }, delay);
+  }
+
+  /** Skip any pending backoff and reconnect right away (used when the user is actively waiting on a command). */
+  private reconnectNow() {
+    if (this.connected || this.connecting || this.socket || this.credentialsRejected) {
+      return;
+    }
+    this.reconnectAttempts = 0;
+    this.clearReconnectTimer();
+    void this.connect();
+  }
+
+  private resetStaleTimer(socket: WebSocket) {
+    if (this.staleTimer) {
+      clearTimeout(this.staleTimer);
+    }
+    this.staleTimer = setTimeout(() => {
+      this.log.warn(`No messages from Anova for ${STALE_CONNECTION_MS / 60_000} minutes; reconnecting`);
+      socket.terminate();
+    }, STALE_CONNECTION_MS);
+  }
+
+  private clearConnectionTimers() {
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = undefined;
+    }
+    if (this.staleTimer) {
+      clearTimeout(this.staleTimer);
+      this.staleTimer = undefined;
+    }
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = undefined;
+    }
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+  }
+
+  private dispatch(message: OvenResponse) {
+    if (message.command === 'EVENT_APO_WIFI_LIST') {
+      message.payload.forEach((oven) => {
+        this.ovenNames.set(oven.cookerId, oven.name);
+        const existingOven = this.ovens.get(oven.cookerId);
+        if (existingOven) {
+          existingOven.name = oven.name;
+        }
+      });
+    } else if (message.command === 'EVENT_APO_STATE') {
+      const ovenId = message.payload.cookerId;
+      this.log.debug(`Oven ${ovenId} state update`);
+      let oven = this.ovens.get(ovenId);
+      if (!oven) {
+        this.log.info(`Found oven ${ovenId}`);
+        const name = this.ovenNames.get(ovenId) || `Oven ${ovenId.substring(0, 4)}`;
+        oven = new AnovaOven(ovenId, name, message.payload.state, this);
+        this.ovens.set(ovenId, oven);
+        this.emit('ovenFound', oven);
+      }
+      oven.updateState(message.payload.state);
+    } else if (message.command === 'RESPONSE') {
+      this.log.debug(`Received response to command ${message.requestId}`);
+      this.emit('commandResponse', message);
+    } else if (message.command === 'EVENT_USER_STATE') {
+      // ignore
+    } else {
+      this.log.debug(`Ignoring message type ${(message as { command: string }).command}`);
+    }
+  }
+
+  private waitUntilConnected(timeoutMs: number): Promise<void> {
+    if (this.isConnected) {
+      return Promise.resolve();
+    }
+    if (!this.running || this.credentialsRejected) {
+      return Promise.reject(new NotConnectedError('Not connected to the Anova cloud'));
+    }
+    this.reconnectNow();
+    return new Promise((resolve, reject) => {
+      const onConnected = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.off('connected', onConnected);
+        reject(new NotConnectedError('Timed out waiting to connect to the Anova cloud'));
+      }, timeoutMs);
+      this.once('connected', onConnected);
+    });
+  }
+
+  /**
+   * Send a command, waiting for a connection if needed. Retries on timeouts and dropped connections,
+   * but not when Anova explicitly rejects the command.
+   */
+  public async sendOvenCommand<T extends OvenCommand>(command: T['command'], payload: T['payload']) {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= COMMAND_ATTEMPTS; attempt++) {
+      try {
+        await this.waitUntilConnected(CONNECT_TIMEOUT_MS + 5_000);
+        await this.sendOnce(command, payload);
+        return;
+      } catch (e) {
+        lastError = e;
+        if (e instanceof CommandRejectedError || this.credentialsRejected || !this.running) {
+          break;
+        }
+        this.log.warn(`${command} attempt ${attempt} of ${COMMAND_ATTEMPTS} failed: ${describeError(e)}`);
+        if (e instanceof CommandTimeoutError) {
+          // The socket may be half-dead; force a fresh connection before retrying.
+          this.socket?.terminate();
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  private sendOnce<T extends OvenCommand>(command: T['command'], payload: T['payload']) {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new NotConnectedError('Not connected to the Anova cloud'));
+    }
     const cmd = {
       command,
       payload,
       requestId: uuidv4(),
     };
-    this.log.info(`Sending command ${cmd.requestId}`);
+    this.log.debug(`Sending command ${JSON.stringify(cmd)}`);
     return new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.log.error(`Timeout waiting for response to command ${cmd.requestId}`);
-        reject(new Error('Timeout waiting for response to command'));
-      }, timeoutMS);
-
-      const watchdog = (response: OvenCommandResponse) => {
-        this.log.info(`Received response to cmd ${cmd.requestId}`);
-        if (response.requestId === cmd.requestId) {
-          this.off('commandResponse', watchdog);
-          clearTimeout(timeout);
-
-          if (response.payload.status === 'ok') {
-            resolve();
-          } else {
-            this.log.error(`Command ${cmd.requestId} failed:`);
-            this.log.error(JSON.stringify(response, null, 2));
-            reject(`Command ${cmd.requestId} failed`);
-          }
+      const onResponse = (response: OvenCommandResponse) => {
+        if (response.requestId !== cmd.requestId) {
+          return;
+        }
+        cleanup();
+        if (response.payload?.status === 'ok') {
+          resolve();
+        } else {
+          this.log.error(`Anova rejected ${command}: ${JSON.stringify(response.payload)}`);
+          reject(new CommandRejectedError(`Anova rejected ${command}`));
         }
       };
-      this.on('commandResponse', watchdog);
-      this.log.info(`Sending command ${JSON.stringify(cmd)}`);
-      this._socket.send(JSON.stringify(cmd));
+      const onDisconnected = () => {
+        cleanup();
+        reject(new NotConnectedError('Connection to the Anova cloud dropped before the command was acknowledged'));
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new CommandTimeoutError(`Timed out waiting for Anova to acknowledge ${command}`));
+      }, COMMAND_TIMEOUT_MS);
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.off('commandResponse', onResponse);
+        this.off('disconnected', onDisconnected);
+      };
+      this.on('commandResponse', onResponse);
+      this.on('disconnected', onDisconnected);
+      socket.send(JSON.stringify(cmd), (err) => {
+        if (err) {
+          cleanup();
+          reject(new NotConnectedError(`Could not send ${command}: ${err.message}`));
+        }
+      });
     });
   }
 }

@@ -193,7 +193,8 @@ export interface StartCookPayload {
 }
 export interface StagesEntity {
     stepType?: 'stage';
-    id: string;
+    /** Generated automatically when a cook starts if not provided. */
+    id?: string;
     title: string;
     description?: string;
     type: 'preheat' | 'cook';

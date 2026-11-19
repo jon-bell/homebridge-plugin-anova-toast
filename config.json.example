@@ -197,7 +197,7 @@
                     "name": "Sous-Vide",
                     "stages": [
                         {
-                          "title": 0,
+                          "title": "Pre-heat",
                           "type": "preheat",
                           "userActionRequired": false,
                           "temperatureBulbs": {
@@ -234,7 +234,7 @@
                           }
                         },
                         {
-                          "title": 0,
+                          "title": "Sous Vide",
                           "type": "cook",
                           "userActionRequired": false,
                           "temperatureBulbs": {
