@@ -1,19 +1,43 @@
 {
-  "pluginAlias": "HomebridgeMakeToast",
+  "pluginAlias": "AnovaToast",
   "pluginType": "platform",
   "singular": true,
+  "headerDisplay": "Recommended: create a personal access token in the Anova Oven app (More → Developer → Personal Access Tokens) and paste it below. Email and password sign-in still works but isn't needed when a token is set.",
+  "footerDisplay": "Recipe switches: if you don't add a `recipes` list, the plugin creates Make Toast, Bake, Sous-Vide and Air Fry switches. To customize them, edit the `recipes` list in the JSON config (see config.json.example in the plugin's repository).",
   "schema": {
     "type": "object",
     "properties": {
-      "email": {
-        "title": "Anova Email Address",
+      "name": {
+        "title": "Name",
         "type": "string",
+        "default": "Anova Oven",
         "required": true
       },
-      "password" : {
-        "title": "Anova Password",
+      "token": {
+        "title": "Anova Personal Access Token",
+        "description": "Starts with \"anova-\".",
         "type": "string",
-        "required": true
+        "x-schema-form": {
+          "type": "password"
+        }
+      },
+      "email": {
+        "title": "Anova Email Address (only if not using a token)",
+        "type": "string",
+        "format": "email",
+        "condition": {
+          "functionBody": "return !model.token;"
+        }
+      },
+      "password": {
+        "title": "Anova Password (only if not using a token)",
+        "type": "string",
+        "x-schema-form": {
+          "type": "password"
+        },
+        "condition": {
+          "functionBody": "return !model.token;"
+        }
       }
     }
   }

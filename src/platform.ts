@@ -1,6 +1,7 @@
 import { API, Characteristic, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
 
-import AnovaOvenService from './AnovaOvenService';
+import AnovaOvenService, { Recipe } from './AnovaOvenService';
+import { DEFAULT_RECIPES } from './defaultRecipes';
 import { AnovaOvenPlatformAccessory } from './platformAccessory';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 
@@ -8,7 +9,7 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service = this.api.hap.Service;
   public readonly Characteristic: typeof Characteristic = this.api.hap.Characteristic;
 
-  private readonly anovaOvenService: AnovaOvenService;
+  private readonly anovaOvenService?: AnovaOvenService;
 
   // this is used to track restored cached accessories
   public readonly accessories: PlatformAccessory[] = [];
@@ -20,7 +21,25 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
   ) {
     this.log.debug('Finished initializing platform:', this.config.name);
 
-    this.anovaOvenService = new AnovaOvenService({ email: config.email, password: config.password }, log);
+    const token = typeof config.token === 'string' ? config.token.trim() : '';
+    if (token && !token.startsWith('anova-')) {
+      this.log.warn('The Anova personal access token should start with "anova-"; check that you copied all of it.');
+    }
+    if (!token && (!config.email || !config.password)) {
+      this.log.error('Add an Anova personal access token (or your Anova email and password) in the plugin settings; '
+        + 'the oven will not be available until you do.');
+    } else {
+      if (!token) {
+        this.log.info('Signing in with email/password. A personal access token is recommended instead; see the plugin README.');
+      }
+      this.anovaOvenService = new AnovaOvenService({
+        token: token || undefined,
+        email: config.email,
+        password: config.password,
+        websocketUrl: config.websocketUrl,
+        authUrl: config.authUrl,
+      }, log);
+    }
 
     // When this event is fired it means Homebridge has restored all cached accessories from disk.
     // Dynamic Platform plugins should only register new accessories after this event was fired,
@@ -28,9 +47,9 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
     // to start discovery of new accessories.
     this.api.on('didFinishLaunching', () => {
       log.debug('Executed didFinishLaunching callback');
-      // run the method to discover / register your devices as accessories
       this.discoverDevices();
     });
+    this.api.on('shutdown', () => this.anovaOvenService?.stop());
   }
 
   /**
@@ -39,40 +58,60 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
    */
   configureAccessory(accessory: PlatformAccessory) {
     this.log.info('Loading accessory from cache:', accessory.displayName);
-
-    // add the restored accessory to the accessories cache so we can track if it has already been registered
     this.accessories.push(accessory);
   }
 
-  async discoverDevices() {
+  private get recipes(): Recipe[] {
+    if (this.config.recipes === undefined) {
+      return DEFAULT_RECIPES;
+    }
+    if (!Array.isArray(this.config.recipes)) {
+      this.log.error('"recipes" in the plugin config must be a list; using the default recipes instead.');
+      return DEFAULT_RECIPES;
+    }
+    return (this.config.recipes as Recipe[]).filter((recipe, idx) => {
+      if (typeof recipe?.name !== 'string' || !recipe.name || !Array.isArray(recipe.stages) || recipe.stages.length === 0) {
+        this.log.warn(`Skipping recipe #${idx + 1}: each recipe needs a "name" and a non-empty "stages" list.`);
+        return false;
+      }
+      return true;
+    });
+  }
 
-    this.anovaOvenService.login();
-    this.anovaOvenService.on('ovenFound', (oven) => {
-      this.log.info('Oven found. Registering toast accessory on', oven.deviceId);
+  discoverDevices() {
+    // Earlier versions stored the whole oven object (including the Anova password) in the accessory context,
+    // which Homebridge writes to its cache file. Replace it with just the device ID.
+    const scrubbed = this.accessories.filter((accessory) => accessory.context?.oven !== undefined);
+    scrubbed.forEach((accessory) => {
+      accessory.context = { deviceId: accessory.context.oven?._id ?? accessory.context.oven?.deviceId };
+    });
+    if (scrubbed.length) {
+      this.api.updatePlatformAccessories(scrubbed);
+    }
 
+    const service = this.anovaOvenService;
+    if (!service) {
+      return;
+    }
+    const recipes = this.recipes;
+
+    service.on('ovenFound', (oven) => {
       const uuid = this.api.hap.uuid.generate(oven.deviceId);
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
       const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
       if (existingAccessory) {
-        // the accessory already exists
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-        new AnovaOvenPlatformAccessory(this, existingAccessory, oven, this.config.recipes);
-        oven.name = `${oven.name}`;
+        existingAccessory.context = { deviceId: oven.deviceId };
+        new AnovaOvenPlatformAccessory(this, existingAccessory, oven, recipes);
+        this.api.updatePlatformAccessories([existingAccessory]);
       } else {
-        // the accessory does not yet exist, so we need to create it
         this.log.info(`Adding new accessory: ${oven.deviceId} ${oven.name}`);
-
         const accessory = new this.api.platformAccessory(oven.name, uuid);
-
-        // store a copy of the device object in the `accessory.context`
-        // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.oven = oven;
-
-        new AnovaOvenPlatformAccessory(this, accessory, oven, this.config.recipes);
+        accessory.context = { deviceId: oven.deviceId };
+        new AnovaOvenPlatformAccessory(this, accessory, oven, recipes);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.accessories.push(accessory);
       }
-
     });
+    service.start();
   }
 }
