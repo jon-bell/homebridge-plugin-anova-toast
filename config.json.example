@@ -10,8 +10,7 @@
         {
             "platform": "AnovaToast",
             "name": "Anova Oven",
-            "email": "YOUR_ANOVA_EMAIL",
-            "password": "YOUR_ANOVA_PASSWORD",
+            "token": "anova-YOUR_PERSONAL_ACCESS_TOKEN",
             "recipes": [
                 {
                     "name": "Make Toast",

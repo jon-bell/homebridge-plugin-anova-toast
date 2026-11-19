@@ -199,8 +199,10 @@ export type Recipe = {
 };
 
 export type AnovaOvenServiceOptions = {
-  email: string;
-  password: string;
+  /** Anova personal access token (starts with "anova-"). Preferred over email/password when set. */
+  token?: string;
+  email?: string;
+  password?: string;
   /** Overrides for local development/testing against a mock server. */
   websocketUrl?: string;
   authUrl?: string;
@@ -259,8 +261,14 @@ export default class AnovaOvenService extends (EventEmitter as new () => TypedEv
 
   /** Builds the URL (including credentials) and subprotocols used to open the socket. */
   protected async getConnectionParameters(): Promise<{ url: string; protocols?: string[] }> {
-    const token = await this.getFirebaseToken();
     const base = this.options.websocketUrl ?? DEFAULT_WEBSOCKET_URL;
+    if (this.options.token) {
+      // Official developer API: https://developer.anovaculinary.com/docs/devices/wifi/authentication
+      return {
+        url: `${base}?token=${encodeURIComponent(this.options.token)}&supportedAccessories=APO`,
+      };
+    }
+    const token = await this.getFirebaseToken();
     return {
       url: `${base}?token=${encodeURIComponent(token)}&supportedAccessories=APO&platform=android`,
       protocols: ['ANOVA_V2'],

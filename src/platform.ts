@@ -21,10 +21,19 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
   ) {
     this.log.debug('Finished initializing platform:', this.config.name);
 
-    if (!config.email || !config.password) {
-      this.log.error('Missing Anova email and/or password in the plugin settings; the oven will not be available.');
+    const token = typeof config.token === 'string' ? config.token.trim() : '';
+    if (token && !token.startsWith('anova-')) {
+      this.log.warn('The Anova personal access token should start with "anova-"; check that you copied all of it.');
+    }
+    if (!token && (!config.email || !config.password)) {
+      this.log.error('Add an Anova personal access token (or your Anova email and password) in the plugin settings; '
+        + 'the oven will not be available until you do.');
     } else {
+      if (!token) {
+        this.log.info('Signing in with email/password. A personal access token is recommended instead; see the plugin README.');
+      }
       this.anovaOvenService = new AnovaOvenService({
+        token: token || undefined,
         email: config.email,
         password: config.password,
         websocketUrl: config.websocketUrl,
