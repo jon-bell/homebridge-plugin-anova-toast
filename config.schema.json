@@ -1,19 +1,30 @@
 {
-  "pluginAlias": "HomebridgeMakeToast",
+  "pluginAlias": "AnovaToast",
   "pluginType": "platform",
   "singular": true,
+  "footerDisplay": "Recipe switches: if you don't add a `recipes` list, the plugin creates Make Toast, Bake, Sous-Vide and Air Fry switches. To customize them, edit the `recipes` list in the JSON config (see config.json.example in the plugin's repository).",
   "schema": {
     "type": "object",
     "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Anova Oven",
+        "required": true
+      },
       "email": {
         "title": "Anova Email Address",
         "type": "string",
+        "format": "email",
         "required": true
       },
-      "password" : {
+      "password": {
         "title": "Anova Password",
         "type": "string",
-        "required": true
+        "required": true,
+        "x-schema-form": {
+          "type": "password"
+        }
       }
     }
   }
