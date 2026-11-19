@@ -1,20 +1,217 @@
 {
-  "pluginAlias": "HomebridgeMakeToast",
+  "pluginAlias": "AnovaToast",
   "pluginType": "platform",
   "singular": true,
+  "headerDisplay": "Recommended: create a personal access token in the Anova Oven app (More → Developer → Personal Access Tokens) and paste it below.",
+  "footerDisplay": "Tip: in the Home app, open the oven and choose \"Show as Separate Tiles\" so Siri can tell the switch, thermostat and sensors apart. \"Hey Siri, turn on the oven\" then starts the main switch, and \"Hey Siri, set the oven temperature to 400\" changes the temperature.",
   "schema": {
     "type": "object",
     "properties": {
-      "email": {
-        "title": "Anova Email Address",
+      "name": {
+        "title": "Name",
         "type": "string",
+        "default": "Anova Oven",
         "required": true
       },
-      "password" : {
-        "title": "Anova Password",
+      "token": {
+        "title": "Anova Personal Access Token",
+        "description": "Starts with \"anova-\".",
         "type": "string",
-        "required": true
+        "x-schema-form": {
+          "type": "password"
+        }
+      },
+      "email": {
+        "title": "Anova Email Address (only if not using a token)",
+        "type": "string",
+        "format": "email",
+        "condition": {
+          "functionBody": "return !model.token;"
+        }
+      },
+      "password": {
+        "title": "Anova Password (only if not using a token)",
+        "type": "string",
+        "x-schema-form": {
+          "type": "password"
+        },
+        "condition": {
+          "functionBody": "return !model.token;"
+        }
+      },
+      "mainSwitchName": {
+        "title": "Main switch name",
+        "description": "Used for the on/off switch, and as the start of the thermostat and sensor names (e.g. \"Oven Preheated\").",
+        "type": "string",
+        "default": "Oven",
+        "placeholder": "Oven"
+      },
+      "ovenMode": {
+        "title": "Heating mode for the main switch and thermostat",
+        "type": "string",
+        "default": "roast",
+        "oneOf": [
+          { "title": "Roast / convection (bottom + rear elements, fan)", "enum": ["roast"] },
+          { "title": "Bake (bottom element, low fan)", "enum": ["bake"] },
+          { "title": "Air fry (rear element, full fan)", "enum": ["airFry"] },
+          { "title": "Broil (top element, no fan)", "enum": ["broil"] },
+          { "title": "Steam (all elements + 100% humidity)", "enum": ["steam"] },
+          { "title": "Sous vide (wet bulb, 100% humidity)", "enum": ["sousVide"] }
+        ]
+      },
+      "defaultTemperatureF": {
+        "title": "Starting temperature (°F)",
+        "description": "Used the first time the main switch is turned on; after that the thermostat remembers the last temperature you set.",
+        "type": "number",
+        "default": 350,
+        "minimum": 77,
+        "maximum": 482
+      },
+      "thermostat": {
+        "title": "Show a thermostat (oven temperature + \"set the oven to 400\")",
+        "type": "boolean",
+        "default": true
+      },
+      "maxCookHours": {
+        "title": "Auto-off after (hours)",
+        "description": "Safety limit for cooks started from HomeKit or Siri: the oven is turned off after this many hours (plus any recipe timer). 0 turns this off.",
+        "type": "number",
+        "default": 3,
+        "minimum": 0
+      },
+      "defaultRecipes": {
+        "title": "Built-in recipe switches",
+        "type": "array",
+        "uniqueItems": true,
+        "default": ["Make Toast", "Bake", "Sous-Vide", "Air Fry"],
+        "items": {
+          "type": "string",
+          "enum": ["Make Toast", "Bake", "Sous-Vide", "Air Fry"]
+        }
+      },
+      "recipes": {
+        "title": "Your recipe switches",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Switch name",
+              "type": "string",
+              "required": true
+            },
+            "mode": {
+              "title": "Mode",
+              "type": "string",
+              "default": "roast",
+              "oneOf": [
+                { "title": "Roast / convection", "enum": ["roast"] },
+                { "title": "Bake", "enum": ["bake"] },
+                { "title": "Air fry", "enum": ["airFry"] },
+                { "title": "Broil", "enum": ["broil"] },
+                { "title": "Steam", "enum": ["steam"] },
+                { "title": "Sous vide", "enum": ["sousVide"] }
+              ]
+            },
+            "temperatureF": {
+              "title": "Temperature (°F)",
+              "type": "number",
+              "required": true,
+              "minimum": 77,
+              "maximum": 482
+            },
+            "steamPercent": {
+              "title": "Steam (%)",
+              "description": "Optional. For Steam mode this is the humidity (default 100%). Ignored for sous vide.",
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "timerMinutes": {
+              "title": "Timer (minutes)",
+              "description": "Optional. Counts down after preheating; you'll get a \"Done\" alert when it ends.",
+              "type": "number",
+              "minimum": 0
+            },
+            "preheat": {
+              "title": "Preheat first",
+              "type": "boolean",
+              "default": true
+            }
+          }
+        }
+      },
+      "preheatedSensor": {
+        "title": "Preheated (alert when the oven reaches temperature)",
+        "type": "boolean",
+        "default": true
+      },
+      "doneSensor": {
+        "title": "Done (alert when a timed cook finishes)",
+        "type": "boolean",
+        "default": true
+      },
+      "doorSensor": {
+        "title": "Door open/closed",
+        "type": "boolean",
+        "default": true
+      },
+      "waterTankSensor": {
+        "title": "Water tank empty",
+        "type": "boolean",
+        "default": true
+      },
+      "descaleSensor": {
+        "title": "Needs descaling",
+        "type": "boolean",
+        "default": true
+      },
+      "probeSensor": {
+        "title": "Food probe temperature",
+        "type": "boolean",
+        "default": true
       }
     }
-  }
+  },
+  "layout": [
+    "name",
+    {
+      "type": "fieldset",
+      "title": "Sign in",
+      "items": ["token", "email", "password"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Main switch and temperature",
+      "description": "Turning on the main switch (or \"Hey Siri, turn on the oven\") cooks with this heating mode at the thermostat's temperature.",
+      "items": ["mainSwitchName", "ovenMode", "defaultTemperatureF", "thermostat", "maxCookHours"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Recipe switches",
+      "description": "One switch per recipe. Turning a recipe switch off only stops the oven if that recipe is the one cooking.",
+      "items": [
+        "defaultRecipes",
+        {
+          "key": "recipes",
+          "type": "array",
+          "buttonText": "Add recipe",
+          "items": [
+            "recipes[].name",
+            "recipes[].mode",
+            "recipes[].temperatureF",
+            "recipes[].steamPercent",
+            "recipes[].timerMinutes",
+            "recipes[].preheat"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Alerts and sensors",
+      "description": "Each one is a sensor in the Home app; turn on notifications for it there to get an alert on your phone.",
+      "items": ["preheatedSensor", "doneSensor", "doorSensor", "waterTankSensor", "descaleSensor", "probeSensor"]
+    }
+  ]
 }
