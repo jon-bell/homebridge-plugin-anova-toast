@@ -46,7 +46,19 @@ export interface OvenStateMessage {
     systemInfo: SystemInfo;
     state: OvenState;
     nodes: Nodes;
-    cook?: { cookId: string; stages: StagesEntity[] };
+    cook?: ActiveCook;
+}
+/** The running cook as reported by the oven (field names as the oven sends them). */
+export interface ActiveCook {
+    cookId: string;
+    stages: StagesEntity[];
+    activeStageId?: string;
+    activeStageIndex?: number;
+    /** Seconds since the cook started. */
+    secondsElapsed?: number;
+    activeStageSecondsElapsed?: number;
+    /** True when the oven is waiting for someone to act, e.g. after the final stage's timer has finished. */
+    stageTransitionPendingUserAction?: boolean;
 }
 export interface SystemInfo {
     online: boolean;
@@ -97,19 +109,22 @@ export interface CurrentOrSetpoint {
 }
 export interface DryStatus {
     current: CurrentOrSetpoint;
-    setpoint: CurrentOrSetpoint;
+    setpoint?: CurrentOrSetpoint;
 }
 export interface DryTopOrDryBottomStatus {
     current: CurrentOrSetpoint;
     overheated: boolean;
 }
 export interface Timer {
+    /** Observed values: "idle", "running". */
     mode: string;
     initial: number;
     current: number;
 }
 export interface TemperatureProbe {
     connected: boolean;
+    current?: CurrentOrSetpoint;
+    setpoint?: CurrentOrSetpoint;
 }
 export interface SteamGenerators {
     mode: string;
@@ -205,6 +220,7 @@ export interface StagesEntity {
     fan: Fan;
     vent: Vent;
     rackPosition?: number;
+    stageTransitionType?: 'automatic' | 'manual';
     steamGenerators?: SteamGenerators;
 }
 export type TemperatureBulbSetPoint = WetBulbSpec | DryBulbSpec;

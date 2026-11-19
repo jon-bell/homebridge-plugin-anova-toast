@@ -1,8 +1,10 @@
 import { API, Characteristic, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
 
 import AnovaOvenService, { Recipe } from './AnovaOvenService';
-import { DEFAULT_RECIPES } from './defaultRecipes';
-import { AnovaOvenPlatformAccessory } from './platformAccessory';
+import { AnovaOvenPlatformAccessory, OvenAccessoryOptions } from './platformAccessory';
+import {
+  DEFAULT_OVEN_MODE, DEFAULT_TEMPERATURE_F, fToC, isCookingMode, resolveRecipes, COOKING_MODES,
+} from './recipes';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 
 export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
@@ -62,20 +64,39 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
   }
 
   private get recipes(): Recipe[] {
-    if (this.config.recipes === undefined) {
-      return DEFAULT_RECIPES;
+    // `advancedRecipes` holds raw Anova stage lists (kept out of the settings form so the UI can't drop them).
+    const advanced = Array.isArray(this.config.advancedRecipes) ? this.config.advancedRecipes : [];
+    const simple = Array.isArray(this.config.recipes) ? this.config.recipes : [];
+    const recipes = this.config.recipes !== undefined && !Array.isArray(this.config.recipes)
+      ? this.config.recipes
+      : [...simple, ...advanced];
+    return resolveRecipes({ recipes, defaultRecipes: this.config.defaultRecipes }, this.log);
+  }
+
+  private get accessoryOptions(): OvenAccessoryOptions {
+    const c = this.config;
+    const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+    if (c.ovenMode !== undefined && !isCookingMode(c.ovenMode)) {
+      this.log.warn(`Unknown "ovenMode" "${c.ovenMode}"; using "${DEFAULT_OVEN_MODE}". `
+        + `Valid modes: ${Object.keys(COOKING_MODES).join(', ')}.`);
     }
-    if (!Array.isArray(this.config.recipes)) {
-      this.log.error('"recipes" in the plugin config must be a list; using the default recipes instead.');
-      return DEFAULT_RECIPES;
-    }
-    return (this.config.recipes as Recipe[]).filter((recipe, idx) => {
-      if (typeof recipe?.name !== 'string' || !recipe.name || !Array.isArray(recipe.stages) || recipe.stages.length === 0) {
-        this.log.warn(`Skipping recipe #${idx + 1}: each recipe needs a "name" and a non-empty "stages" list.`);
-        return false;
-      }
-      return true;
-    });
+    const name = typeof c.mainSwitchName === 'string' && c.mainSwitchName.trim() ? c.mainSwitchName.trim() : 'Oven';
+    const sensor = (key: string) => c[key] !== false;
+    return {
+      mainSwitchName: name,
+      ovenMode: isCookingMode(c.ovenMode) ? c.ovenMode : DEFAULT_OVEN_MODE,
+      defaultTemperatureC: fToC(num(c.defaultTemperatureF, DEFAULT_TEMPERATURE_F)),
+      thermostat: c.thermostat !== false,
+      sensors: {
+        preheated: sensor('preheatedSensor'),
+        done: sensor('doneSensor'),
+        door: sensor('doorSensor'),
+        waterTank: sensor('waterTankSensor'),
+        descale: sensor('descaleSensor'),
+        probe: sensor('probeSensor'),
+      },
+      maxCookHours: Math.max(0, num(c.maxCookHours, 3)),
+    };
   }
 
   discoverDevices() {
@@ -94,20 +115,23 @@ export class AnovaOvenHomebridgePlatform implements DynamicPlatformPlugin {
       return;
     }
     const recipes = this.recipes;
+    const options = this.accessoryOptions;
 
     service.on('ovenFound', (oven) => {
       const uuid = this.api.hap.uuid.generate(oven.deviceId);
       const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
       if (existingAccessory) {
         this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-        existingAccessory.context = { deviceId: oven.deviceId };
-        new AnovaOvenPlatformAccessory(this, existingAccessory, oven, recipes);
+        // Keep saved settings (e.g. target temperature); drop anything else, such as the old oven object.
+        const { targetC, autoOff } = existingAccessory.context ?? {};
+        existingAccessory.context = { deviceId: oven.deviceId, targetC, autoOff };
+        new AnovaOvenPlatformAccessory(this, existingAccessory, oven, recipes, options);
         this.api.updatePlatformAccessories([existingAccessory]);
       } else {
         this.log.info(`Adding new accessory: ${oven.deviceId} ${oven.name}`);
         const accessory = new this.api.platformAccessory(oven.name, uuid);
         accessory.context = { deviceId: oven.deviceId };
-        new AnovaOvenPlatformAccessory(this, accessory, oven, recipes);
+        new AnovaOvenPlatformAccessory(this, accessory, oven, recipes, options);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.accessories.push(accessory);
       }

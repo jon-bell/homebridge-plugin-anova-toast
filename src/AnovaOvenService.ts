@@ -7,6 +7,12 @@ import {
   AnovaOvenEvent, DeviceID, OvenCommand, OvenCommandResponse, OvenResponse, OvenStateMessage,
   StagesEntity, SteamGenerators, TemperatureBulbSetPoint,
 } from './AnovaTypes';
+
+/** After a stop, ignore late state messages that still show the stopped cook for this long. */
+const STALE_COOK_WINDOW_MS = 5000;
+
+/** A stage counts as preheated when the oven is within this many degrees of the setpoint (for cooks without a preheat stage). */
+const PREHEAT_TOLERANCE_C = 3;
 import { Logger } from 'homebridge';
 
 const DEFAULT_WEBSOCKET_URL = 'wss://devices.anovaculinary.io/';
@@ -122,8 +128,14 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
     return this._name;
   }
 
+  private stoppedCook?: { cookId: string; until: number };
+
   /** Apply a state update received from the Anova cloud. */
   public updateState(update: OvenStateMessage) {
+    if (this.stoppedCook && update.cook?.cookId === this.stoppedCook.cookId && Date.now() < this.stoppedCook.until) {
+      // Sent before the oven processed our stop; don't let it flip things back on.
+      update = { ...update, cook: undefined };
+    }
     const prev = this._state;
     this._state = update;
     if (update.state?.mode !== prev.state?.mode) {
@@ -148,15 +160,110 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
     return this._state;
   }
 
-  public async stopCook() {
-    await this.service.sendOvenCommand('CMD_APO_STOP', {
-      type: 'CMD_APO_STOP',
-      id: this.deviceId,
-    });
-    if (this._state.cook) {
-      this._state = { ...this._state, cook: undefined };
-      this.emit('cookEnd');
+  /** The stage the oven is currently running, if cooking. */
+  public get activeStage(): StagesEntity | undefined {
+    const cook = this._state.cook;
+    if (!cook?.stages?.length) {
+      return undefined;
     }
+    const byId = cook.activeStageId ? cook.stages.find((s) => s.id === cook.activeStageId) : undefined;
+    return byId ?? cook.stages[cook.activeStageIndex ?? 0];
+  }
+
+  private get activeStageIndex(): number {
+    const cook = this._state.cook;
+    if (!cook?.stages) {
+      return -1;
+    }
+    const byId = cook.activeStageId ? cook.stages.findIndex((s) => s.id === cook.activeStageId) : -1;
+    return byId >= 0 ? byId : cook.activeStageIndex ?? 0;
+  }
+
+  /** Oven temperature in °C, from the wet bulb in sous vide mode and the dry bulb otherwise. */
+  public get currentTemperatureC(): number | undefined {
+    const bulbs = this._state.nodes?.temperatureBulbs;
+    const mode = this.activeStage?.temperatureBulbs?.mode ?? bulbs?.mode;
+    return mode === 'wet' ? bulbs?.wet?.current?.celsius : bulbs?.dry?.current?.celsius;
+  }
+
+  /** Target temperature of the active stage in °C, if cooking. */
+  public get setpointC(): number | undefined {
+    const bulbs = this.activeStage?.temperatureBulbs;
+    if (!bulbs) {
+      return undefined;
+    }
+    return bulbs.mode === 'wet' ? bulbs.wet?.setpoint?.celsius : bulbs.dry?.setpoint?.celsius;
+  }
+
+  /**
+   * True once the oven has finished preheating for the current cook: it has moved past its preheat
+   * stage(s), or (for cooks without one) reached the setpoint.
+   */
+  public get isPreheated(): boolean {
+    const stage = this.activeStage;
+    if (!this.isOn || !stage || stage.type === 'preheat') {
+      return false;
+    }
+    const idx = this.activeStageIndex;
+    if (this._state.cook?.stages.slice(0, Math.max(0, idx)).some((s) => s.type === 'preheat')) {
+      return true;
+    }
+    const current = this.currentTemperatureC;
+    const target = this.setpointC;
+    return current !== undefined && target !== undefined && current >= target - PREHEAT_TOLERANCE_C;
+  }
+
+  /**
+   * True when the final stage has finished and the oven is waiting for someone (it keeps holding
+   * temperature rather than turning itself off).
+   */
+  public get isDone(): boolean {
+    const cook = this._state.cook;
+    return Boolean(this.isOn && cook?.stageTransitionPendingUserAction && this.activeStageIndex === cook.stages.length - 1);
+  }
+
+  public get isDoorClosed(): boolean {
+    return this._state.nodes?.door?.closed !== false;
+  }
+
+  public get isWaterTankEmpty(): boolean {
+    return this._state.nodes?.waterTank?.empty === true;
+  }
+
+  public get needsDescaling(): boolean {
+    return this._state.nodes?.steamGenerators?.boiler?.descaleRequired === true;
+  }
+
+  public get probe(): { connected: boolean; celsius?: number } {
+    const probe = this._state.nodes?.temperatureProbe;
+    return { connected: probe?.connected === true, celsius: probe?.current?.celsius };
+  }
+
+  public get temperatureUnit(): 'C' | 'F' {
+    return this._state.state?.temperatureUnit === 'C' ? 'C' : 'F';
+  }
+
+  private stopInFlight?: Promise<void>;
+
+  /** Stop the oven. Concurrent calls (e.g. several HomeKit switches turned off at once) share one command. */
+  public stopCook(): Promise<void> {
+    if (!this.stopInFlight) {
+      this.stopInFlight = this.service.sendOvenCommand('CMD_APO_STOP', {
+        type: 'CMD_APO_STOP',
+        id: this.deviceId,
+      }).then(() => {
+        if (this._state.cook?.cookId) {
+          this.stoppedCook = { cookId: this._state.cook.cookId, until: Date.now() + STALE_COOK_WINDOW_MS };
+        }
+        if (this._state.cook) {
+          this._state = { ...this._state, cook: undefined };
+          this.emit('cookEnd');
+        }
+      }).finally(() => {
+        this.stopInFlight = undefined;
+      });
+    }
+    return this.stopInFlight;
   }
 
   /**
@@ -171,6 +278,17 @@ export class AnovaOven extends (EventEmitter as new () => TypedEventEmitter<Anov
       type: 'CMD_APO_START',
       id: this.deviceId,
     });
+    // Reflect the new cook right away; the oven's own state update follows within a second or two.
+    const wasOn = this.isOn;
+    this._state = {
+      ...this._state,
+      cook: { cookId, stages: cookStages, activeStageIndex: 0, activeStageId: cookStages[0]?.id },
+    };
+    if (!wasOn) {
+      this.emit('cookStart', this._state.cook);
+    } else {
+      this.emit('ovenState', this._state);
+    }
     return cookId;
   }
 
